@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SOS</title>
+<style>
+html,body{margin:0;height:100%;font-family:Arial,Helvetica,sans-serif;color:#ff3b3b}
+body{background:#0b1030;display:flex;align-items:center;justify-content:center;text-align:center}
+body.fail{background:#2a0610}
+body.alert{background:#b00000;color:#fff;animation:flash 1s linear infinite}
+@keyframes flash{0%,49.9%{background:#b00000}50%,100%{background:#200000}}
+.box{width:80%;max-width:320px}
+h1{font-size:28px;font-weight:bold;margin:0 0 16px}
+h1.big{font-size:56px}
+p{font-size:16px;margin:12px 0 0}
+.bar{border:2px solid #ff3b3b;height:22px;padding:2px}
+#fill{background:#ff3b3b;height:100%;width:0}
+#pct{font-size:14px;margin-top:8px}
+button{font:bold 20px Arial,Helvetica,sans-serif;color:#fff;background:#d01010;border:0;padding:22px 24px;margin-top:10px;width:100%}
+#hint{font-size:14px;margin-top:28px;opacity:.85}
+#dbg{display:none;position:fixed;left:8px;right:8px;bottom:8px;text-align:left;font:11px monospace;color:#9f9;white-space:pre-wrap;z-index:9}
+.s{display:none}
+body.ready .s-ready,body.load .s-load,body.fail .s-fail,body.alert .s-alert{display:block}
+@media (prefers-reduced-motion:reduce){body.alert{animation:none}}
+</style>
+</head>
+<body class="ready">
+<div class="box">
+  <div class="s s-ready">
+    <h1>SOS</h1>
+    <button id="go">PRESS TO SEND SOS</button>
+  </div>
+  <div class="s s-load">
+    <h1>Sending SOS...</h1>
+    <div class="bar"><div id="fill"></div></div>
+    <div id="pct">0%</div>
+    <p id="msg">Searching for network</p>
+  </div>
+  <div class="s s-fail">
+    <h1>Failed to connect</h1>
+    <p>No signal.</p>
+  </div>
+  <div class="s s-alert">
+    <h1 class="big">ALERT</h1>
+    <p>FLOOD WARNING</p>
+    <div id="hint">TAP TO SILENCE</div>
+  </div>
+</div>
+<div id="dbg"></div>
+
+<script>
+(function(){
+  var $=function(i){return document.getElementById(i)};
+  var body=document.body, fill=$('fill'), pct=$('pct'), msg=$('msg'), hint=$('hint'), dbg=$('dbg');
+
+  /* ===== SETTINGS (all times in milliseconds) ===== */
+  var STEP_MS=500;            /* time between each jump of the loading bar */
+  var FAIL_AT=7000;           /* "Failed to connect" appears this long after the tap */
+  var STALL_MIN=81;           /* loading bar stops at a random number between these two */
+  var STALL_MAX=97;
+  var SIREN_DELAY_MS=17500;   /* siren starts at least this long after "Failed to connect" */
+  var SYNC_GRID_MS=10000;     /* rounds the siren start up to the next clock :x0 seconds so phones start together. 0 = off */
+  var SIREN_MS=15000;         /* siren stops by itself after this long (tap also stops it) */
+
+  var SR=22050;
+  var state='ready', blocked=false, iv=0, stopTO=0, vt=0;
+  var DEBUG=/debug/.test(location.search);
+  function log(s){ if(DEBUG){ dbg.style.display='block'; dbg.textContent+=s+'\n'; } }
+  window.addEventListener('error',function(e){ log('ERROR '+e.message); });
+
+  /* Builds the sound in memory (no network, no external file) */
+  function synth(siren){
+    var n=SR*(siren?2:1), out=new Float32Array(n), i;
+    if(siren){
+      var fr=new Float32Array(n), tot=0;
+      for(i=0;i<n;i++){                      /* pitch sweeps 800 -> 1800 -> 800 Hz every 2 s */
+        var x=i/n, tri=x<0.5?x*2:2-x*2;
+        fr[i]=800+1000*tri; tot+=fr[i]/SR;
+      }
+      var k=Math.round(tot)/tot;             /* whole number of cycles, so the loop has no click */
+      var ph=0, peak=0;
+      for(i=0;i<n;i++){
+        out[i]=Math.sin(ph)+Math.sin(3*ph)/3+Math.sin(5*ph)/5;
+        ph+=2*Math.PI*fr[i]*k/SR;
+        if(Math.abs(out[i])>peak){peak=Math.abs(out[i]);}
+      }
+      for(i=0;i<n;i++){out[i]=out[i]/peak*0.95;}
+    }
+    return out;
+  }
+  function toWav(out){
+    var n=out.length, i, buf=new ArrayBuffer(44+n*2), v=new DataView(buf);
+    function str(o,s){for(var j=0;j<s.length;j++){v.setUint8(o+j,s.charCodeAt(j));}}
+    str(0,'RIFF'); v.setUint32(4,36+n*2,true); str(8,'WAVE'); str(12,'fmt ');
+    v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true);
+    v.setUint32(24,SR,true); v.setUint32(28,SR*2,true); v.setUint16(32,2,true); v.setUint16(34,16,true);
+    str(36,'data'); v.setUint32(40,n*2,true);
+    for(i=0;i<n;i++){v.setInt16(44+i*2,Math.round(out[i]*32767),true);}
+    var bytes=new Uint8Array(buf), s='';
+    for(i=0;i<bytes.length;i+=8192){s+=String.fromCharCode.apply(null,bytes.subarray(i,i+8192));}
+    return 'data:audio/wav;base64,'+btoa(s);
+  }
+
+  var PCM=null, SILENT_URL='', SIREN_URL='';
+  try{ PCM=synth(true); SIREN_URL=toWav(PCM); SILENT_URL=toWav(synth(false)); }catch(e){ log('synth '+e); }
+
+  /* Two ways to make sound. Web Audio is tried first, a plain <audio> tag is the backup. */
+  var AC=window.AudioContext||window.webkitAudioContext, ctx=null, sirenBuf=null, sirenNode=null;
+  var a=new Audio(); a.loop=true;
+
+  function vib(){ try{ if(navigator.vibrate){navigator.vibrate([600,250,600]);} }catch(e){} }
+  function setPct(v){ fill.style.width=v+'%'; pct.textContent=v+'%'; }
+
+  /* The tap on the first screen: this is what lets the phone play sound later */
+  function begin(){
+    try{ if(navigator.audioSession){navigator.audioSession.type='playback';} }catch(e){}
+    try{
+      if(AC){
+        ctx=new AC();
+        var r=ctx.resume(); if(r&&r.catch){r.catch(function(){});}
+        var b=ctx.createBuffer(1,1,SR), s=ctx.createBufferSource();
+        s.buffer=b; s.connect(ctx.destination); s.start(0);
+        if(PCM){ sirenBuf=ctx.createBuffer(1,PCM.length,SR); sirenBuf.getChannelData(0).set(PCM); }
+      }
+    }catch(e){ ctx=null; log('ctx '+e); }
+    try{                                       /* silent loop: keeps the phone's media channel open (works around the silent switch) */
+      a.src=SILENT_URL; var p=a.play();
+      if(p&&p.catch){ p.catch(function(e){ log('silent loop '+e.name); }); }
+    }catch(e){}
+    try{ if(navigator.wakeLock){navigator.wakeLock.request('screen').catch(function(){});} }catch(e){}
+    log('tap ok, webaudio '+(ctx?'yes':'no'));
+    load();
+  }
+
+  function load(){
+    state='load'; body.className='load';
+    var p=0, stall=STALL_MIN+Math.floor(Math.random()*(STALL_MAX-STALL_MIN+1));
+    setPct(0);
+    iv=setInterval(function(){
+      if(p<stall){
+        p=Math.min(stall,p+Math.floor(Math.random()*12)+6);
+        setPct(p);
+      }else{
+        msg.textContent='Retrying';
+      }
+    },STEP_MS);
+    setTimeout(fail,FAIL_AT);
+  }
+
+  function fail(){
+    clearInterval(iv);
+    state='fail'; body.className='fail';
+    var now=Date.now(), t=now+SIREN_DELAY_MS;
+    if(SYNC_GRID_MS>0){ t=Math.ceil(t/SYNC_GRID_MS)*SYNC_GRID_MS; }
+    setTimeout(sirenOn,t-now);
+  }
+
+  function startWebAudio(){
+    if(sirenNode){return;}
+    var s=ctx.createBufferSource(); s.buffer=sirenBuf; s.loop=true;
+    s.connect(ctx.destination); s.start(0); sirenNode=s;
+    log('siren via web audio');
+  }
+  function startHtmlAudio(res,rej){
+    try{
+      a.src=SIREN_URL; var p=a.play();
+      if(p&&p.then){ p.then(function(){ log('siren via audio tag'); res(); },function(e){ log('audio tag '+e.name); rej(e); }); }
+      else{ res(); }
+    }catch(e){ rej(e); }
+  }
+  /* resolves if some sound started, rejects if the phone refused both ways */
+  function playSiren(){
+    return new Promise(function(res,rej){
+      if(sirenNode){ res(); return; }
+      if(!ctx||!sirenBuf){ startHtmlAudio(res,rej); return; }
+      log('ctx state '+ctx.state);
+      if(ctx.state==='running'){
+        try{ startWebAudio(); res(); }catch(e){ startHtmlAudio(res,rej); }
+        return;
+      }
+      var done=false;
+      try{
+        ctx.resume().then(function(){
+          if(!done&&ctx.state==='running'){ done=true; try{ startWebAudio(); res(); }catch(e){ startHtmlAudio(res,rej); } }
+        }).catch(function(){});
+      }catch(e){}
+      setTimeout(function(){ if(!done){ done=true; log('web audio would not start'); startHtmlAudio(res,rej); } },400);
+    });
+  }
+  function refused(e){ blocked=true; hint.textContent='TAP FOR SOUND'; }
+
+  function sirenOn(){
+    state='alert'; blocked=false; hint.textContent='TAP TO SILENCE';
+    body.className='alert';
+    playSiren().then(function(){},refused);
+    vib(); vt=setInterval(vib,1500);
+    stopTO=setTimeout(silence,SIREN_MS);
+  }
+
+  function silence(){
+    clearTimeout(stopTO); clearInterval(vt);
+    try{ if(sirenNode){ sirenNode.stop(0); sirenNode=null; } }catch(e){}
+    try{ a.pause(); }catch(e){}
+    try{ if(navigator.vibrate){navigator.vibrate(0);} }catch(e){}
+    state='done'; body.className='fail';
+  }
+
+  document.addEventListener('click',function(){
+    if(state==='ready'){ begin(); return; }   /* a tap anywhere on the first screen counts as "send" */
+    if(state!=='alert'){ return; }
+    if(blocked){                              /* sound was refused: this tap retries it */
+      playSiren().then(function(){ blocked=false; hint.textContent='TAP TO SILENCE'; },function(){});
+      return;
+    }
+    silence();
+  });
+})();
+</script>
+</body>
+</html>
